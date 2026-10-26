@@ -1,74 +1,127 @@
+"""Race lap leaderboard (stdlib-only; safe to import without input files)."""
+
+import argparse
+import datetime as dt
 import re
-import datetime
+import sys
 from collections import OrderedDict
 
+_ABBR = re.compile(r"^([A-Z0-9]+)_([^_]+)_([^_]+)$")
+_TIME = re.compile(r"^([A-Z]+).*?(\d{2}:\d{2}:\d{2}\.\d+)$")
+
+
 def create_racer_abbreviations_dict(file_name):
-    """Retrieves {'abbreviation': (name, team)}" format dict from abbreviations.txt"""
-    abbreviations_dict = {}
-    with open(file_name, 'r') as fn:
-        for line in fn:
-            matchObj = re.match(r'^(\w+)_([a-zA-Z\s]+)_([a-zA-Z\s]+)$', line)
-            # group(1) is abbreviation, i.e 'SVM'
-            abbreviations_dict[matchObj.group(1)] = (
-                matchObj.group(2),  # name of a pilot
-                matchObj.group(3).rstrip(),  # team
-            )
-    return abbreviations_dict
+    """Load ABBR_Name_Team rows, rejecting ambiguous or malformed data."""
+    racers = {}
+    with open(file_name, encoding="utf-8") as source:
+        for line_number, raw in enumerate(source, 1):
+            line = raw.strip()
+            if not line:
+                continue
+            match = _ABBR.fullmatch(line)
+            if not match:
+                raise ValueError(f"{file_name}:{line_number}: invalid racer row")
+            abbreviation, name, team = match.groups()
+            if not name.strip() or not team.strip():
+                raise ValueError(f"{file_name}:{line_number}: empty name or team")
+            if abbreviation in racers:
+                raise ValueError(f"{file_name}:{line_number}: duplicate {abbreviation}")
+            racers[abbreviation] = (name.strip(), team.strip())
+    return racers
 
 
-# {'abbreviation of pilot': ('name of pilot, 'team')}
-abbr_dict = create_racer_abbreviations_dict(
-    'abbreviations.txt')
-
-
-# returns timing log from start.log or end.log in {'abbreviation': time} format
 def retrieve_timings_from_log(file_name):
-    timing_log = {}
-    with open(file_name, 'r') as fn:
-        for line in fn:
-            # matches 2 groups: abbreviation of a racer and time
-            matchObj = re.match(r'^([A-Z]+).*(\d{2}:\d+:\d+\.\d+)$', line)
-            # converts time from a string to datetime object
-            lap_time = datetime.datetime.strptime(
-                matchObj.group(2).rstrip(), '%H:%M:%S.%f')
-            # adds key, value to a timing_log
-            timing_log[matchObj.group(1)] = lap_time
-    return timing_log
+    """Load ABBR...HH:MM:SS.fraction rows as time-of-day datetimes."""
+    timings = {}
+    with open(file_name, encoding="utf-8") as source:
+        for line_number, raw in enumerate(source, 1):
+            line = raw.strip()
+            if not line:
+                continue
+            match = _TIME.fullmatch(line)
+            if not match:
+                raise ValueError(f"{file_name}:{line_number}: invalid timing row")
+            abbreviation, clock = match.groups()
+            if abbreviation in timings:
+                raise ValueError(f"{file_name}:{line_number}: duplicate {abbreviation}")
+            try:
+                timings[abbreviation] = dt.datetime.strptime(clock, "%H:%M:%S.%f")
+            except ValueError as exc:
+                raise ValueError(
+                    f"{file_name}:{line_number}: invalid clock {clock}"
+                ) from exc
+    return timings
 
 
-start_timings = retrieve_timings_from_log('start.log')
-end_timings = retrieve_timings_from_log('end.log')
+def sorted_individual_results(start_timings_, end_timings_, abbr_dict_,
+                              reverse_order=False):
+    """Order elapsed laps; support time-of-day laps crossing midnight once."""
+    start_keys = set(start_timings_)
+    end_keys = set(end_timings_)
+    if start_keys != end_keys:
+        raise ValueError(
+            f"start/end racers differ: missing ends={sorted(start_keys - end_keys)}, "
+            f"missing starts={sorted(end_keys - start_keys)}"
+        )
+    unknown = start_keys - set(abbr_dict_)
+    if unknown:
+        raise ValueError(f"unknown racer abbreviations: {sorted(unknown)}")
+    laps = {}
+    for racer in start_keys:
+        elapsed = end_timings_[racer] - start_timings_[racer]
+        if elapsed < dt.timedelta(0):
+            elapsed += dt.timedelta(days=1)
+        laps[racer] = elapsed
+    return OrderedDict(
+        sorted(laps.items(), key=lambda item: (item[1], item[0]),
+               reverse=reverse_order)
+    )
 
 
-def sorted_individual_results(start_timings_, end_timings_, abbr_dict_, reverse_order=False):
-    """ 
-    Receives start and end timings and returns an OrderedDict with 
-    {abbreviations:timedeltas}
-    """
-    # creating dict with best lap results
-    lap_results = {key: end_timings_[key] - start_timings_.get(key, 0)
-                   for key in start_timings_.keys()}
-    sorted_results = dict(
-        sorted(lap_results.items(), key=lambda x: x[1], reverse=reverse_order))
-    return sorted_results
+def format_lap(elapsed):
+    """Return precise HH:MM:SS.mmm or MM:SS.mmm without string slicing."""
+    milliseconds = round(elapsed.total_seconds() * 1000)
+    if milliseconds < 0:
+        raise ValueError("negative lap")
+    total_seconds, milli = divmod(milliseconds, 1000)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02}:{minutes:02}:{seconds:02}.{milli:03}"
+    return f"{minutes:02}:{seconds:02}.{milli:03}"
 
 
-sorted_lap_results = sorted_individual_results(
-    start_timings, end_timings, abbr_dict)
-
-# prints result board to a console
-def print_result_board(sorted_lap_results_):
-    counter = 1
-    for key, value in sorted_lap_results_.items():
-        racer_name = abbr_dict[key][0]
-        team_name = abbr_dict[key][1]
-        best_time = str(value)[2:-3]
-        print(("{: <3} {: <18} | {: <30}  | {}".format(
-            str(counter)+'.', racer_name, team_name, best_time)))
-        if counter == 15:
-            print(
-                '----------------------------------------------------------------------')
-        counter += 1
+def print_result_board(sorted_lap_results_, abbr_dict_, output=None):
+    """Print rank, racer name, team and lap, without module-level globals."""
+    stream = output if output is not None else sys.stdout
+    for rank, (abbreviation, elapsed) in enumerate(sorted_lap_results_.items(), 1):
+        name, team = abbr_dict_[abbreviation]
+        print(f"{rank:<3} {name:<18} | {team:<30} | {format_lap(elapsed)}",
+              file=stream)
+        if rank == 15:
+            print("-" * 70, file=stream)
 
 
-print_result_board(sorted_lap_results)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Race lap leaderboard")
+    parser.add_argument("--abbreviations", default="abbreviations.txt")
+    parser.add_argument("--start", default="start.log")
+    parser.add_argument("--end", default="end.log")
+    parser.add_argument("--reverse", action="store_true",
+                        help="Show slowest racer first")
+    args = parser.parse_args(argv)
+    try:
+        abbreviations = create_racer_abbreviations_dict(args.abbreviations)
+        start = retrieve_timings_from_log(args.start)
+        end = retrieve_timings_from_log(args.end)
+        results = sorted_individual_results(
+            start, end, abbreviations, reverse_order=args.reverse
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    print_result_board(results, abbreviations)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
